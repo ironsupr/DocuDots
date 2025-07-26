@@ -1,0 +1,14 @@
+# Core PDF processing library
+PyMuPDF==1.23.14
+
+# Additional utilities for robust file handling and logging
+pathlib2==2.3.7
+
+# JSON handling (built-in json module is sufficient, but jsonschema for validation)
+jsonschema==4.20.0
+
+# Logging enhancements
+colorlog==6.8.0
+
+# Type hints and development tools
+typing-extensions==4.9.0
