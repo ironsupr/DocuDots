@@ -14,15 +14,25 @@ import os
 import sys
 import json
 import logging
+import time
 from pathlib import Path
 from typing import Dict, List, Any, Optional
 from collections import Counter
 import fitz  # PyMuPDF
 
-# Configure logging for better debugging and monitoring
+# Import our new utilities
+from utils.exceptions import (
+    PDFValidationError, PDFProcessingError, ResourceLimitError,
+    HeadingDetectionError, OutputGenerationError
+)
+from utils.config import config
+from utils.validators import InputValidator
+from utils.retry import retry_pdf_operations, log_performance, timeout
+
+# Configure enhanced logging
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
+    level=getattr(logging, config.logging_config.level),
+    format=config.logging_config.format,
     handlers=[
         logging.StreamHandler(sys.stdout)
     ]
@@ -37,7 +47,7 @@ class PDFStructureAnalyzer:
     
     def __init__(self, input_dir: str = "/app/input", output_dir: str = "/app/output"):
         """
-        Initialize the PDF analyzer.
+        Initialize the PDF analyzer with enhanced validation.
         
         Args:
             input_dir: Directory containing input PDF files
@@ -45,27 +55,53 @@ class PDFStructureAnalyzer:
         """
         self.input_dir = Path(input_dir)
         self.output_dir = Path(output_dir)
+        self.config = config
+        self.validator = InputValidator()
         
-        # Ensure directories exist
-        self.input_dir.mkdir(parents=True, exist_ok=True)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        
-        logger.info(f"Initialized PDF analyzer - Input: {self.input_dir}, Output: {self.output_dir}")
+        # Validate and prepare directories
+        try:
+            self.validator.validate_processing_environment(self.input_dir, self.output_dir)
+            logger.info(f"Initialized PDF analyzer - Input: {self.input_dir}, Output: {self.output_dir}")
+        except Exception as e:
+            logger.error(f"Failed to initialize PDF analyzer: {e}")
+            raise PDFProcessingError(f"Initialization failed: {e}", stage="initialization")
     
     def get_pdf_files(self) -> List[Path]:
         """
-        Get all PDF files from the input directory.
+        Get all valid PDF files from the input directory.
         
         Returns:
-            List of Path objects for PDF files
+            List of Path objects for validated PDF files
         """
-        pdf_files = list(self.input_dir.glob("*.pdf"))
-        logger.info(f"Found {len(pdf_files)} PDF files in {self.input_dir}")
-        return pdf_files
+        try:
+            # Use validator to get only valid PDF files
+            validation_summary = self.validator.validate_processing_environment(
+                self.input_dir, self.output_dir
+            )
+            
+            valid_files = validation_summary['input_summary']['valid_file_paths']
+            invalid_files = validation_summary['input_summary']['invalid_file_details']
+            
+            # Log validation results
+            logger.info(f"Found {len(valid_files)} valid PDF files in {self.input_dir}")
+            
+            if invalid_files:
+                logger.warning(f"Found {len(invalid_files)} invalid files:")
+                for invalid_file in invalid_files:
+                    logger.warning(f"  - {invalid_file['file'].name}: {invalid_file['error']}")
+            
+            return valid_files
+            
+        except Exception as e:
+            logger.error(f"Error scanning PDF files: {e}")
+            return []
     
+    @retry_pdf_operations
+    @log_performance
+    @timeout(seconds=config.processing_limits.max_processing_time_seconds)
     def analyze_pdf_structure(self, pdf_path: Path) -> Dict[str, Any]:
         """
-        Analyze a single PDF file and extract its structural outline.
+        Analyze a single PDF file and extract its structural outline with enhanced error handling.
         This is the main method that orchestrates the complete analysis workflow.
         
         Args:
@@ -73,21 +109,41 @@ class PDFStructureAnalyzer:
             
         Returns:
             Dictionary containing the complete analysis results
+            
+        Raises:
+            PDFValidationError: If PDF validation fails
+            PDFProcessingError: If processing encounters an error
+            ResourceLimitError: If resource limits are exceeded
         """
         logger.info(f"Starting analysis of PDF: {pdf_path.name}")
+        start_time = time.time()
+        doc = None
         
         try:
-            # Step 1: Open the PDF document
-            doc = fitz.open(pdf_path)
-            logger.info(f"Successfully opened PDF with {len(doc)} pages")
+            # Step 1: Validate the PDF file before processing
+            is_valid, error_msg = self.validator.pdf_validator.validate_pdf_file(pdf_path)
+            if not is_valid:
+                raise PDFValidationError(error_msg, filename=pdf_path.name)
             
-            # Step 2: Initialize the result structure
+            # Step 2: Open the PDF document with error handling
+            try:
+                doc = fitz.open(pdf_path)
+                logger.info(f"Successfully opened PDF with {len(doc)} pages")
+            except Exception as e:
+                raise PDFProcessingError(
+                    f"Failed to open PDF: {e}",
+                    filename=pdf_path.name,
+                    stage="pdf_opening"
+                )
+            
+            # Step 3: Initialize the result structure
             result = {
                 "document_info": {
                     "filename": pdf_path.name,
                     "total_pages": len(doc),
                     "title": "",  # Will be populated later
-                    "processing_timestamp": None
+                    "processing_timestamp": time.time(),
+                    "file_size_mb": round(pdf_path.stat().st_size / (1024 * 1024), 2)
                 },
                 "structural_outline": {
                     "title": "",
@@ -95,28 +151,56 @@ class PDFStructureAnalyzer:
                 }
             }
             
-            # Step 3: Extract all text blocks with their properties
+            # Step 4: Extract all text blocks with their properties
             logger.info("Extracting text blocks from PDF...")
-            text_blocks = self._extract_text_blocks(doc)
+            try:
+                text_blocks = self._extract_text_blocks(doc)
+                
+                # Check if we exceeded text block limits
+                if len(text_blocks) > self.config.processing_limits.max_text_blocks:
+                    logger.warning(f"Text blocks ({len(text_blocks)}) exceed limit "
+                                 f"({self.config.processing_limits.max_text_blocks}). Truncating...")
+                    text_blocks = text_blocks[:self.config.processing_limits.max_text_blocks]
+                
+                # Print total number of text blocks found (confirmation output)
+                print(f"✅ Found {len(text_blocks)} text blocks in {pdf_path.name}")
+                logger.info(f"Total text blocks extracted: {len(text_blocks)}")
+                
+            except Exception as e:
+                raise PDFProcessingError(
+                    f"Text extraction failed: {e}",
+                    filename=pdf_path.name,
+                    stage="text_extraction"
+                )
             
-            # Print total number of text blocks found (confirmation output)
-            print(f"✅ Found {len(text_blocks)} text blocks in {pdf_path.name}")
-            logger.info(f"Total text blocks extracted: {len(text_blocks)}")
-            
-            # Step 4: Perform comprehensive heading identification and classification
+            # Step 5: Perform comprehensive heading identification and classification
             logger.info("Performing heading identification and classification...")
-            structural_outline = self._extract_headings_from_blocks(text_blocks)
-            result["structural_outline"] = structural_outline
+            try:
+                structural_outline = self._extract_headings_from_blocks(text_blocks)
+                result["structural_outline"] = structural_outline
+                
+            except Exception as e:
+                raise HeadingDetectionError(
+                    f"Heading detection failed: {e}"
+                ) from e
             
-            # Step 5: Extract the final title and classified headings (as requested)
+            # Step 6: Extract the final title and classified headings (as requested)
             final_title = structural_outline["title"]
             final_headings = structural_outline["headings"]
+            
+            # Limit headings if needed
+            if len(final_headings) > self.config.processing_limits.max_headings_per_document:
+                logger.warning(f"Limiting headings from {len(final_headings)} to "
+                             f"{self.config.processing_limits.max_headings_per_document}")
+                final_headings = final_headings[:self.config.processing_limits.max_headings_per_document]
+                structural_outline["headings"] = final_headings
             
             # Update document info with extracted title
             result["document_info"]["title"] = final_title
             
-            # Step 6: Log and display final results
-            logger.info(f"Analysis complete - Title: '{final_title}'")
+            # Step 7: Log and display final results
+            processing_time = time.time() - start_time
+            logger.info(f"Analysis complete - Title: '{final_title}' (took {processing_time:.2f}s)")
             logger.info(f"Final headings count: {len(final_headings)}")
             
             # Print comprehensive summary to console
@@ -138,27 +222,41 @@ class PDFStructureAnalyzer:
             if len(final_headings) > 8:
                 print(f"   ... and {len(final_headings) - 8} more headings")
             
-            # Step 7: Store text blocks summary for debugging
+            # Step 8: Store text blocks summary for debugging
             result["text_blocks_summary"] = {
                 "total_blocks": len(text_blocks),
                 "sample_blocks": text_blocks[:5]  # Store first 5 blocks as sample
             }
             
-            # Step 8: Close the document
+            # Step 9: Close the document
             doc.close()
             
             logger.info(f"Successfully completed analysis of {pdf_path.name}")
             return result
             
-        except Exception as e:
-            logger.error(f"Error analyzing {pdf_path.name}: {str(e)}")
-            # Return error result but still attempt to close document if it was opened
-            try:
-                if 'doc' in locals():
+        except (PDFValidationError, PDFProcessingError, ResourceLimitError, HeadingDetectionError) as e:
+            # These are our custom exceptions - re-raise them
+            logger.error(f"Known error analyzing {pdf_path.name}: {e}")
+            if doc:
+                try:
                     doc.close()
-            except:
-                pass
-            return self._create_error_result(pdf_path.name, str(e))
+                except:
+                    pass
+            raise
+            
+        except Exception as e:
+            # Unexpected errors
+            logger.error(f"Unexpected error analyzing {pdf_path.name}: {str(e)}")
+            if doc:
+                try:
+                    doc.close()
+                except:
+                    pass
+            raise PDFProcessingError(
+                f"Unexpected error during analysis: {e}",
+                filename=pdf_path.name,
+                stage="unknown"
+            ) from e
     
     def _extract_document_title(self, doc: fitz.Document) -> str:
         """
@@ -280,7 +378,10 @@ class PDFStructureAnalyzer:
             
         except Exception as e:
             logger.error(f"Error extracting text blocks: {str(e)}")
-            return []
+            raise PDFProcessingError(
+                f"Text block extraction failed: {e}",
+                stage="text_extraction"
+            )
 
     def _analyze_font_styles(self, text_blocks: List[Dict[str, Any]]) -> Dict[str, Any]:
         """
@@ -910,7 +1011,7 @@ class PDFStructureAnalyzer:
 
     def save_result(self, result: Dict[str, Any], pdf_filename: str) -> bool:
         """
-        Save the analysis result to a JSON file in the required format.
+        Save the analysis result to a JSON file in the required format with error handling.
         
         Args:
             result: Analysis result dictionary
@@ -918,6 +1019,9 @@ class PDFStructureAnalyzer:
             
         Returns:
             True if saved successfully, False otherwise
+            
+        Raises:
+            OutputGenerationError: If output generation fails
         """
         try:
             # Create output filename by replacing .pdf with .json
@@ -932,69 +1036,109 @@ class PDFStructureAnalyzer:
             # Create the final JSON output in the required format
             final_json_output = self._create_final_json_output(title, headings)
             
+            # Validate JSON output before writing
+            try:
+                json.dumps(final_json_output)  # Test serialization
+            except (TypeError, ValueError) as e:
+                raise OutputGenerationError(f"JSON serialization failed: {e}")
+            
             # Write JSON file with clean formatting
             with open(output_path, 'w', encoding='utf-8') as f:
                 json.dump(final_json_output, f, indent=2, ensure_ascii=False)
+            
+            # Verify file was written correctly
+            if not output_path.exists() or output_path.stat().st_size == 0:
+                raise OutputGenerationError("Output file was not created or is empty")
             
             logger.info(f"Saved final JSON output to {output_path}")
             logger.info(f"Output contains: Title + {len(final_json_output['outline'])} headings")
             
             return True
             
+        except OutputGenerationError:
+            raise
         except Exception as e:
             logger.error(f"Error saving result for {pdf_filename}: {str(e)}")
-            return False
+            raise OutputGenerationError(f"Failed to save output: {e}") from e
     
     def process_all_pdfs(self) -> Dict[str, Any]:
         """
-        Process all PDF files in the input directory with complete workflow.
+        Process all PDF files in the input directory with complete workflow and enhanced error handling.
         
         Returns:
             Summary of processing results
         """
+        start_time = time.time()
         pdf_files = self.get_pdf_files()
         
         if not pdf_files:
-            logger.warning("No PDF files found in input directory")
-            print("⚠️  No PDF files found in input directory")
-            print(f"   Please add PDF files to: {self.input_dir}")
-            return {"total_files": 0, "processed": 0, "errors": 0}
+            logger.warning("No valid PDF files found in input directory")
+            print("⚠️  No valid PDF files found in input directory")
+            print(f"   Please add valid PDF files to: {self.input_dir}")
+            return {"total_files": 0, "processed": 0, "errors": 0, "processing_time": 0}
         
         print(f"\n🚀 Starting PDF Structure Analysis")
         print(f"📁 Input directory: {self.input_dir}")
         print(f"📁 Output directory: {self.output_dir}")
-        print(f"📄 Found {len(pdf_files)} PDF file(s) to process")
+        print(f"📄 Found {len(pdf_files)} valid PDF file(s) to process")
         print("-" * 60)
         
         processed_count = 0
         error_count = 0
+        error_details = []
         
         for i, pdf_file in enumerate(pdf_files, 1):
+            file_start_time = time.time()
             try:
                 print(f"\n[{i}/{len(pdf_files)}] Processing: {pdf_file.name}")
                 print("=" * 50)
                 
-                # Perform complete analysis workflow
+                # Perform complete analysis workflow with error handling
                 result = self.analyze_pdf_structure(pdf_file)
                 
                 # Save the final JSON output in required format
-                if self.save_result(result, pdf_file.name):
-                    processed_count += 1
-                    print(f"✅ Successfully processed {pdf_file.name}")
-                    
-                    # Show final output file info
-                    output_filename = pdf_file.name.replace('.pdf', '.json')
-                    print(f"📄 Output saved as: {output_filename}")
-                else:
-                    error_count += 1
-                    print(f"❌ Failed to save results for {pdf_file.name}")
-                    
-            except Exception as e:
-                logger.error(f"Unexpected error processing {pdf_file.name}: {str(e)}")
-                print(f"❌ Unexpected error processing {pdf_file.name}: {str(e)}")
+                self.save_result(result, pdf_file.name)
+                processed_count += 1
+                
+                file_processing_time = time.time() - file_start_time
+                print(f"✅ Successfully processed {pdf_file.name} in {file_processing_time:.2f}s")
+                
+                # Show final output file info
+                output_filename = pdf_file.name.replace('.pdf', '.json')
+                print(f"📄 Output saved as: {output_filename}")
+                
+            except (PDFValidationError, PDFProcessingError, ResourceLimitError, 
+                    HeadingDetectionError, OutputGenerationError) as e:
                 error_count += 1
+                error_details.append({
+                    'file': pdf_file.name,
+                    'error_type': type(e).__name__,
+                    'error_message': str(e),
+                    'stage': getattr(e, 'stage', 'unknown')
+                })
+                
+                print(f"❌ Failed to process {pdf_file.name}: {e}")
+                logger.error(f"Processing failed for {pdf_file.name}: {e}")
+                
+            except KeyboardInterrupt:
+                print(f"\n⚠️  Processing interrupted by user")
+                logger.info("Processing interrupted by user")
+                break
+                
+            except Exception as e:
+                error_count += 1
+                error_details.append({
+                    'file': pdf_file.name,
+                    'error_type': 'UnexpectedError',
+                    'error_message': str(e),
+                    'stage': 'unknown'
+                })
+                
+                print(f"❌ Unexpected error processing {pdf_file.name}: {e}")
+                logger.error(f"Unexpected error processing {pdf_file.name}: {str(e)}", exc_info=True)
         
         # Final summary
+        total_time = time.time() - start_time
         print("\n" + "=" * 60)
         print("📊 PROCESSING SUMMARY")
         print("-" * 30)
@@ -1003,16 +1147,24 @@ class PDFStructureAnalyzer:
             "total_files": len(pdf_files),
             "processed": processed_count,
             "errors": error_count,
-            "success_rate": round((processed_count / len(pdf_files)) * 100, 1) if pdf_files else 0
+            "success_rate": round((processed_count / len(pdf_files)) * 100, 1) if pdf_files else 0,
+            "processing_time": round(total_time, 2),
+            "error_details": error_details
         }
         
         print(f"Total files: {summary['total_files']}")
         print(f"Successfully processed: {summary['processed']}")
         print(f"Errors: {summary['errors']}")
         print(f"Success rate: {summary['success_rate']}%")
+        print(f"Total processing time: {summary['processing_time']}s")
         
         if processed_count > 0:
             print(f"\n✅ Results available in: {self.output_dir}")
+        
+        if error_details:
+            print(f"\n❌ Error Summary:")
+            for error in error_details:
+                print(f"  - {error['file']}: {error['error_type']} in {error['stage']}")
         
         logger.info(f"Processing complete: {summary}")
         return summary
