@@ -968,8 +968,13 @@ class PDFStructureAnalyzer:
         document_title = self._identify_document_title(text_blocks)
         
         # Limit headings to reasonable number and clean up
+        # Filter out title from headings to avoid duplication
         final_headings = []
         for heading in classified_headings[:20]:  # Limit to top 20 headings
+            # Skip this heading if its text matches the document title
+            if heading["text"].strip() == document_title.strip():
+                continue
+                
             final_headings.append({
                 "level": heading["level"],
                 "text": heading["text"],

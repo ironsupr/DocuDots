@@ -2,7 +2,7 @@
 # Build and Run Script for DocuDots PDF Analyzer (PowerShell)
 
 param(
-    [Parameter(Position=0)]
+    [Parameter(Position = 0)]
     [ValidateSet("build", "run", "dev", "test", "clean", "")]
     [string]$Command = ""
 )
@@ -34,7 +34,8 @@ function Build-Image {
     docker build --platform linux/amd64 -t docudots:latest .
     if ($LASTEXITCODE -eq 0) {
         Write-Host "Build completed successfully!" -ForegroundColor Green
-    } else {
+    }
+    else {
         Write-Host "Build failed!" -ForegroundColor Red
         exit 1
     }
@@ -68,7 +69,8 @@ function Run-Analyzer {
     
     if ($LASTEXITCODE -eq 0) {
         Write-Host "Processing completed! Check .\output directory for results." -ForegroundColor Green
-    } else {
+    }
+    else {
         Write-Host "Processing failed!" -ForegroundColor Red
     }
 }
