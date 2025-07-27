@@ -15,6 +15,7 @@ import sys
 import json
 import logging
 import time
+import re
 from pathlib import Path
 from typing import Dict, List, Any, Optional
 from collections import Counter
@@ -28,6 +29,7 @@ from utils.exceptions import (
 from utils.config import config
 from utils.validators import InputValidator
 from utils.retry import retry_pdf_operations, log_performance, timeout
+from utils.multilingual import MultilingualSupport
 
 # Configure enhanced logging
 logging.basicConfig(
@@ -47,7 +49,7 @@ class PDFStructureAnalyzer:
     
     def __init__(self, input_dir: str = "/app/input", output_dir: str = "/app/output"):
         """
-        Initialize the PDF analyzer with enhanced validation.
+        Initialize the PDF analyzer with enhanced validation and multi-lingual support.
         
         Args:
             input_dir: Directory containing input PDF files
@@ -57,6 +59,7 @@ class PDFStructureAnalyzer:
         self.output_dir = Path(output_dir)
         self.config = config
         self.validator = InputValidator()
+        self.multilingual = MultilingualSupport()
         
         # Validate and prepare directories
         try:
@@ -155,6 +158,10 @@ class PDFStructureAnalyzer:
             logger.info("Extracting text blocks from PDF...")
             try:
                 text_blocks = self._extract_text_blocks(doc)
+                
+                # Step 4.1: Enhance text blocks with multi-lingual support
+                logger.info("Applying multi-lingual text processing...")
+                text_blocks = self.multilingual.enhance_text_extraction(text_blocks)
                 
                 # Check if we exceeded text block limits
                 if len(text_blocks) > self.config.processing_limits.max_text_blocks:
@@ -361,7 +368,7 @@ class PDFStructureAnalyzer:
                                 "font_size": round(font_size, 2),
                                 "font_name": font_name,
                                 "is_bold": is_bold,
-                                "page_number": page_num + 1,  # 1-indexed page numbers
+                                "page_number": page_num,  # 0-indexed page numbers
                                 "position": {
                                     "x": round(bbox[0], 2),
                                     "y": round(bbox[1], 2),
@@ -444,10 +451,10 @@ class PDFStructureAnalyzer:
     def _filter_heading_candidates(self, text_blocks: List[Dict[str, Any]], 
                                  font_analysis: Dict[str, Any]) -> List[Dict[str, Any]]:
         """
-        Filter text blocks to identify potential headings.
+        Filter text blocks to identify potential headings with multi-lingual support.
         
         Args:
-            text_blocks: List of all text blocks
+            text_blocks: List of all text blocks (enhanced with language info)
             font_analysis: Results from font analysis
             
         Returns:
@@ -459,19 +466,31 @@ class PDFStructureAnalyzer:
         heading_candidates = []
         
         for block in text_blocks:
-            text = block["text"].strip()
+            text = block.get("text", "").strip()
+            normalized_text = block.get("normalized_text", text)
             font_size = block["font_size"]
             is_bold = block["is_bold"]
+            detected_language = block.get("detected_language", "english")
+            is_heading_candidate = block.get("is_heading_candidate", False)
             
             # Skip very short or very long text
             if len(text) < 3 or len(text) > 200:
                 continue
             
-            # Skip text that looks like body content (common patterns)
-            if any(pattern in text.lower() for pattern in [
-                "figure", "table", "page", "www.", "http", "@", 
-                "copyright", "©", "et al.", "ibid"
-            ]):
+            # Multi-lingual skip patterns
+            skip_patterns = {
+                'english': ["figure", "table", "page", "www.", "http", "@", "copyright", "©", "et al.", "ibid"],
+                'spanish': ["figura", "tabla", "página", "www.", "http", "@", "derechos", "©"],
+                'french': ["figure", "tableau", "page", "www.", "http", "@", "droits", "©"],
+                'german': ["abbildung", "tabelle", "seite", "www.", "http", "@", "urheberrecht", "©"],
+                'chinese': ["图", "表", "页", "www.", "http", "@", "©"],
+                'japanese': ["図", "表", "ページ", "www.", "http", "@", "©"],
+                'arabic': ["شكل", "جدول", "صفحة", "www.", "http", "@", "©"],
+                'hindi': ["चित्र", "तालिका", "पृष्ठ", "www.", "http", "@", "©"],
+            }
+            
+            current_skip_patterns = skip_patterns.get(detected_language, skip_patterns['english'])
+            if any(pattern in text.lower() for pattern in current_skip_patterns):
                 continue
             
             # Multiple criteria for heading identification
@@ -483,14 +502,27 @@ class PDFStructureAnalyzer:
                 # Bold text with reasonable size
                 (is_bold and font_size >= body_font_size * 0.9) or
                 # Significantly larger than average
-                font_size > avg_font_size * 1.3
+                font_size > avg_font_size * 1.3 or
+                # Multilingual heading pattern detected
+                is_heading_candidate
             )
             
             # Additional filters for better heading detection
             if is_potential_heading:
-                # Check text characteristics
-                word_count = len(text.split())
-                has_sentence_ending = text.endswith(('.', '!', '?'))
+                # Check text characteristics (language-aware)
+                language_config = self.multilingual.get_language_config(detected_language)
+                word_separator = language_config.get('word_separator', ' ')
+                
+                if word_separator:
+                    word_count = len(text.split(word_separator))
+                else:
+                    # For languages without word separators (Chinese, Japanese)
+                    word_count = len(text)
+                
+                # Language-specific sentence ending patterns
+                punctuation_pattern = language_config.get('punctuation', r'[.!?;:]')
+                has_sentence_ending = bool(re.search(punctuation_pattern + r'$', text))
+                
                 is_all_caps = text.isupper() and len(text) > 3
                 starts_with_number = text.split('.')[0].replace(' ', '').isdigit()
                 
@@ -505,13 +537,23 @@ class PDFStructureAnalyzer:
                 if is_bold:
                     heading_score += 20
                 
-                # Length factor (prefer shorter text, 0-20 points)
-                if word_count <= 8:
-                    heading_score += 20 - (word_count * 2)
+                # Length factor (language-aware, 0-20 points)
+                if detected_language in ['chinese', 'japanese']:
+                    # Character-based languages
+                    if len(text) <= 20:
+                        heading_score += 20 - len(text)
+                else:
+                    # Word-based languages
+                    if word_count <= 8:
+                        heading_score += 20 - (word_count * 2)
                 
                 # Position factor (early in page gets bonus, 0-10 points)
                 if block["position"]["y"] < 200:  # Top portion of page
                     heading_score += 10
+                
+                # Multilingual pattern bonus (0-15 points)
+                if is_heading_candidate:
+                    heading_score += 15
                 
                 # Text pattern bonuses/penalties
                 if not has_sentence_ending:
@@ -527,6 +569,7 @@ class PDFStructureAnalyzer:
                 if heading_score >= 25:
                     block_copy = block.copy()
                     block_copy["heading_score"] = round(heading_score, 2)
+                    block_copy["detected_language"] = detected_language
                     heading_candidates.append(block_copy)
         
         # Sort by document order (page number, then Y position)
@@ -1002,7 +1045,7 @@ class PDFStructureAnalyzer:
             heading_object = {
                 "level": heading["level"],      # H1, H2, or H3
                 "text": heading["text"],        # Heading text content
-                "page": heading["page"]         # Page number (1-indexed)
+                "page": heading["page"]         # Page number (0-indexed)
             }
             final_json["outline"].append(heading_object)
         
@@ -1217,8 +1260,8 @@ def main():
             print('   {')
             print('     "title": "Document Title",')
             print('     "outline": [')
-            print('       {"level": "H1", "text": "Heading Text", "page": 1},')
-            print('       {"level": "H2", "text": "Sub Heading", "page": 2}')
+            print('       {"level": "H1", "text": "Heading Text", "page": 0},')
+            print('       {"level": "H2", "text": "Sub Heading", "page": 1}')
             print('     ]')
             print('   }')
             sys.exit(0)
